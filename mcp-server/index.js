@@ -90,6 +90,90 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "mesh_task_publish",
+      description:
+        "Publish a task to the mesh for any idle agent to pick up. Include repo URL, branch, spec path, and task details.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repo: {
+            type: "string",
+            description: "Git repo URL (https://github.com/...)",
+          },
+          branch: { type: "string", description: "Branch to work on" },
+          specPath: {
+            type: "string",
+            description: "Path to spec tasks.md relative to repo root",
+          },
+          taskId: { type: "string", description: "Task ID from the spec" },
+          taskText: {
+            type: "string",
+            description: "Full task description text",
+          },
+          subTasks: {
+            type: "array",
+            items: { type: "string" },
+            description: "Sub-task descriptions",
+          },
+        },
+        required: ["repo", "taskId", "taskText"],
+      },
+    },
+    {
+      name: "mesh_task_claim",
+      description:
+        "Claim an open task from the mesh. Uses atomic transaction to prevent double-claim.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Mesh task document ID" },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "mesh_task_complete",
+      description: "Mark a claimed task as completed with the commit SHA.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Mesh task document ID" },
+          commitSha: {
+            type: "string",
+            description: "Git commit SHA of the completed work",
+          },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "mesh_task_fail",
+      description: "Mark a claimed task as failed with a reason.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Mesh task document ID" },
+          reason: { type: "string", description: "Why the task failed" },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "mesh_task_list",
+      description:
+        "List tasks on the mesh. Optionally filter by status (open, claimed, completed, failed).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            description:
+              "Filter by status: open, claimed, completed, failed. Omit for all.",
+          },
+        },
+      },
+    },
   ],
 }));
 
@@ -130,6 +214,67 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await meshFetch("agents", "POST", {
         agent: AGENT_ID,
         meta: args.meta || {},
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
+    case "mesh_task_publish": {
+      const result = await meshFetch("tasks", "POST", {
+        action: "publish",
+        from: AGENT_ID,
+        repo: args.repo,
+        branch: args.branch || "internal-testing",
+        specPath: args.specPath || null,
+        taskId: args.taskId,
+        taskText: args.taskText,
+        subTasks: args.subTasks || [],
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
+    case "mesh_task_claim": {
+      const result = await meshFetch("tasks", "POST", {
+        action: "claim",
+        id: args.id,
+        agent: AGENT_ID,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
+    case "mesh_task_complete": {
+      const result = await meshFetch("tasks", "POST", {
+        action: "complete",
+        id: args.id,
+        agent: AGENT_ID,
+        commitSha: args.commitSha || null,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
+    case "mesh_task_fail": {
+      const result = await meshFetch("tasks", "POST", {
+        action: "fail",
+        id: args.id,
+        agent: AGENT_ID,
+        reason: args.reason || "unknown",
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
+    case "mesh_task_list": {
+      const result = await meshFetch("tasks", "POST", {
+        action: "list",
+        status: args.status || undefined,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],

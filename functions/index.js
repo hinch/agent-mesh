@@ -133,3 +133,174 @@ exports.agents = onRequest({ region: "us-east1" }, async (req, res) => {
   });
   res.json({ agents });
 });
+
+/**
+ * POST /tasks
+ * Body: { action: "publish"|"claim"|"complete"|"fail"|"list", ... }
+ *
+ * Task lifecycle: open -> claimed -> completed|failed
+ *
+ * publish: { action:"publish", from, repo, branch, specPath, taskId, taskText, subTasks }
+ * claim:   { action:"claim", id, agent }
+ * complete:{ action:"complete", id, agent, commitSha }
+ * fail:    { action:"fail", id, agent, reason }
+ * list:    { action:"list", status? }  -- optional filter by status
+ */
+exports.tasks = onRequest({ region: "us-east1" }, async (req, res) => {
+  if (req.method !== "POST") return res.status(405).json({ e: 1 });
+  if (!auth(req)) return res.status(401).json({ e: 2 });
+
+  const { action } = req.body;
+  if (!action) return res.status(400).json({ e: 3, msg: "action required" });
+
+  const tasksCol = db.collection("tasks");
+
+  switch (action) {
+    case "publish": {
+      const { from, repo, branch, specPath, taskId, taskText, subTasks } =
+        req.body;
+      if (!from || !repo || !taskId || !taskText)
+        return res.status(400).json({ e: 3, msg: "missing fields" });
+
+      const task = {
+        from,
+        repo,
+        branch: branch || "internal-testing",
+        specPath: specPath || null,
+        taskId,
+        taskText,
+        subTasks: subTasks || [],
+        status: "open",
+        claimedBy: null,
+        claimedAt: null,
+        completedAt: null,
+        commitSha: null,
+        failReason: null,
+        publishedAt: FieldValue.serverTimestamp(),
+      };
+      const ref = await tasksCol.add(task);
+      return res.json({ id: ref.id, status: "open" });
+    }
+
+    case "claim": {
+      const { id, agent } = req.body;
+      if (!id || !agent)
+        return res.status(400).json({ e: 3, msg: "id and agent required" });
+
+      // Atomic claim via transaction — prevents double-claim
+      try {
+        await db.runTransaction(async (tx) => {
+          const ref = tasksCol.doc(id);
+          const doc = await tx.get(ref);
+          if (!doc.exists) throw new Error("not_found");
+          if (doc.data().status !== "open") throw new Error("already_claimed");
+          tx.update(ref, {
+            status: "claimed",
+            claimedBy: agent,
+            claimedAt: FieldValue.serverTimestamp(),
+          });
+        });
+        return res.json({ ok: true, status: "claimed" });
+      } catch (e) {
+        if (e.message === "not_found")
+          return res.status(404).json({ e: 4, msg: "task not found" });
+        if (e.message === "already_claimed")
+          return res.status(409).json({ e: 5, msg: "task already claimed" });
+        throw e;
+      }
+    }
+
+    case "complete": {
+      const { id, agent, commitSha } = req.body;
+      if (!id || !agent)
+        return res.status(400).json({ e: 3, msg: "id and agent required" });
+
+      const ref = tasksCol.doc(id);
+      const doc = await ref.get();
+      if (!doc.exists) return res.status(404).json({ e: 4 });
+      if (doc.data().claimedBy !== agent)
+        return res.status(403).json({ e: 6, msg: "not your task" });
+
+      await ref.update({
+        status: "completed",
+        commitSha: commitSha || null,
+        completedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Notify the originator
+      await db.collection("messages").add({
+        from: agent,
+        to: doc.data().from,
+        payload: `T:done/${id} sha=${commitSha || "none"};task=${doc.data().taskId}`,
+        replyTo: null,
+        ts: FieldValue.serverTimestamp(),
+        read: false,
+      });
+
+      return res.json({ ok: true, status: "completed" });
+    }
+
+    case "fail": {
+      const { id, agent, reason } = req.body;
+      if (!id || !agent)
+        return res.status(400).json({ e: 3, msg: "id and agent required" });
+
+      const ref = tasksCol.doc(id);
+      const doc = await ref.get();
+      if (!doc.exists) return res.status(404).json({ e: 4 });
+
+      await ref.update({
+        status: "failed",
+        failReason: reason || "unknown",
+        completedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Notify the originator
+      await db.collection("messages").add({
+        from: agent,
+        to: doc.data().from,
+        payload: `T:fail/${id} reason=${reason || "unknown"};task=${doc.data().taskId}`,
+        replyTo: null,
+        ts: FieldValue.serverTimestamp(),
+        read: false,
+      });
+
+      return res.json({ ok: true, status: "failed" });
+    }
+
+    case "list": {
+      const { status } = req.body;
+      let query = tasksCol.orderBy("publishedAt", "desc").limit(50);
+      if (status) query = tasksCol.where("status", "==", status).limit(50);
+      const snap = await query.get();
+      const tasks = [];
+      snap.forEach((doc) => {
+        const d = doc.data();
+        tasks.push({
+          id: doc.id,
+          from: d.from,
+          repo: d.repo,
+          branch: d.branch,
+          specPath: d.specPath,
+          taskId: d.taskId,
+          taskText: d.taskText,
+          subTasks: d.subTasks,
+          status: d.status,
+          claimedBy: d.claimedBy,
+          claimedAt: d.claimedAt ? d.claimedAt.toDate().toISOString() : null,
+          completedAt: d.completedAt
+            ? d.completedAt.toDate().toISOString()
+            : null,
+          commitSha: d.commitSha,
+          publishedAt: d.publishedAt
+            ? d.publishedAt.toDate().toISOString()
+            : null,
+        });
+      });
+      return res.json({ tasks });
+    }
+
+    default:
+      return res.status(400).json({ e: 3, msg: `unknown action: ${action}` });
+  }
+});
