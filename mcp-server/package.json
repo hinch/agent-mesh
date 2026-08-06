@@ -1,0 +1,13 @@
+{
+  "name": "agent-mesh-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for agent-mesh cross-device messaging",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "agent-mesh-mcp": "./index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
