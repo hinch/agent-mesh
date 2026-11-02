@@ -242,4 +242,4 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 
 ## License
 
-No license has been specified yet. Add a `LICENSE` file before reusing or redistributing.
+[MIT](LICENSE) © 2026 hinch. You're free to use, modify, and self-host it; keep the copyright notice.

@@ -1,6 +1,7 @@
 {
   "name": "agent-mesh-functions",
   "version": "1.3.0",
+  "license": "MIT",
   "description": "Cross-device agent messaging relay",
   "main": "index.js",
   "engines": {
