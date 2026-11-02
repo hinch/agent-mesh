@@ -30,6 +30,8 @@ function shouldDeliver(msg, agent, base, nowMs, tsMs) {
   if (msg.to !== base && msg.to !== "*") return false;
   if (msg.from === agent) return false;
   if (typeof tsMs === "number" && nowMs - tsMs > FANOUT_WINDOW_MS) return false;
+  // Legacy fan-out docs (pre-readBy) already marked read are considered delivered.
+  if (!Array.isArray(msg.readBy) && msg.read === true) return false;
   const readBy = Array.isArray(msg.readBy) ? msg.readBy : [];
   return !readBy.includes(agent);
 }

@@ -61,6 +61,11 @@ test("role and broadcast fan-out deliver once to each instance", () => {
   assert.ok(!lib.shouldDeliver({ ...bc, readBy: ["orch-1"] }, "orch-1", "orch", NOW, NOW));
   // missing readBy on legacy docs counts as undelivered
   assert.ok(lib.shouldDeliver({ to: "*", from: "x" }, "y", "y", NOW, NOW));
+  // legacy docs already read (no readBy) must not be re-delivered
+  assert.ok(!lib.shouldDeliver({ to: "*", from: "x", read: true }, "y", "y", NOW, NOW));
+  assert.ok(!lib.shouldDeliver({ to: "orch", from: "x", read: true }, "orch-1", "orch", NOW, NOW));
+  // but readBy present takes precedence over legacy read flag
+  assert.ok(lib.shouldDeliver({ to: "orch", from: "x", read: true, readBy: [] }, "orch-1", "orch", NOW, NOW));
 });
 
 test("fan-out ignores messages older than the window; isFanOut", () => {
