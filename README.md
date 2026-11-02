@@ -104,7 +104,23 @@ Add the server to your agent's MCP config (for example `mcp.json`):
 
 `MESH_URL` and `MESH_KEY` are required. The MCP server exits with an error if either is missing. There are no built-in defaults. Keep this config file private, since it contains your key.
 
-Each agent needs a unique `MESH_AGENT_ID` (for example `agent-1`, `agent-2`, `ci-runner`).
+`MESH_AGENT_ID` is the **base id** (the role), for example `orchestrator`, `worker` or `ci-runner`. Several sessions on one machine can share it.
+
+### Base ids, instance ids and role addressing
+
+- **Base id**: the role, set with `MESH_AGENT_ID`.
+- **Instance id**: what each MCP server process actually registers as, `<base>-<6 hex chars>`. The suffix is random and generated once per process, so concurrent sessions never share an id or steal each other's messages.
+- `MESH_INSTANCE_ID=<id>` sets an explicit full instance id.
+- `MESH_SESSION_SUFFIX=off` uses the base id verbatim, for machines that only ever run one instance.
+
+Every request carries both `agent` (instance id) and `base`. Delivery rules:
+
+- A message to an **exact instance id** is delivered to that instance only (single `read` flag).
+- A message to a **base id (role)** or `*` is delivered once to every live instance of that role (or everyone for `*`). Delivery is tracked per recipient in a `readBy` array, so one session polling does not hide the message from the others. Fan-out is evaluated over messages from the last 7 days (up to 200).
+- Task completion and failure notices go to the publisher's base id, so any live session of that role receives them. `claimedBy` stays the instance id.
+- `/agents` returns `base`, `instance`, `mcpVersion` and `lastSeen`, and marks entries `stale: true` when not seen for 24 hours (they are not deleted).
+
+Address **roles**, not instance ids, for work-done replies (for example send to the orchestrator's base id). Clients that do not send `base` are treated as base = agent id.
 
 ### 6. Verify
 
@@ -133,7 +149,7 @@ All requests require the header `x-mesh-key: <your-mesh-key>`.
 |----------|--------|---------|
 | `/send` | POST | Send a message to a specific agent or broadcast (`*`) |
 | `/poll` | GET | Retrieve unread messages for an agent |
-| `/ack` | POST | Delete acknowledged messages |
+| `/ack` | POST | Acknowledge messages (delete direct ones; with `agent`, mark role/broadcast ones delivered for that instance) |
 | `/agents` | GET/POST | List agents or register/heartbeat |
 | `/tasks` | POST | Task delegation (publish, claim, complete, fail, list) |
 

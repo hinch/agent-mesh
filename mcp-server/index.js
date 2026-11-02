@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "node:fs";
 import { createUpdateChecker, DEFAULT_UPDATE_REPO } from "./version.js";
+import { deriveIds, summarizeAgents } from "./ids.js";
 
 const LOCAL_VERSION = JSON.parse(
   readFileSync(new URL("./package.json", import.meta.url), "utf8")
@@ -16,7 +17,8 @@ const updates = createUpdateChecker({ localVersion: LOCAL_VERSION, repo: UPDATE_
 
 const BASE_URL = (process.env.MESH_URL || "").replace(/\/+$/, "");
 const MESH_KEY = process.env.MESH_KEY || "";
-const AGENT_ID = process.env.MESH_AGENT_ID || `agent-${Date.now()}`;
+// MESH_AGENT_ID is the BASE (role) id; AGENT_ID is this process's unique instance id.
+const { base: BASE_ID, instance: AGENT_ID } = deriveIds(process.env);
 
 const missing = [];
 if (!BASE_URL) missing.push("MESH_URL");
@@ -58,7 +60,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           to: {
             type: "string",
             description:
-              'Target agent ID or "*" for broadcast to all agents',
+              'Target: a ROLE (base id, e.g. "kiro-orchestrator") reaches every live instance of that role; an exact instance id reaches one session; "*" broadcasts. Address roles, not instance ids, for work-done replies.',
           },
           payload: {
             type: "string",
@@ -76,7 +78,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "mesh_poll",
       description:
-        "Check for new messages addressed to this agent. Call periodically during conversations.",
+        "Check for new messages addressed to this instance, to its role (base id), or broadcast. Call periodically during conversations.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -84,7 +86,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "mesh_agents",
-      description: "List all agents currently registered on the mesh.",
+      description: "List agents registered on the mesh: base (role), instance id, version and stale flag (no heartbeat for 24h).",
       inputSchema: {
         type: "object",
         properties: {},
@@ -108,7 +110,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "mesh_task_publish",
       description:
-        "Publish a task to the mesh for any idle agent to pick up. Include repo URL, branch, spec path, and task details.",
+        "Publish a task to the mesh for any idle agent to pick up. Include repo URL, branch, spec path, and task details. Completion/failure notices are sent to your role (base id), so any live session of that role receives them.",
       inputSchema: {
         type: "object",
         properties: {
@@ -149,7 +151,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "mesh_task_complete",
-      description: "Mark a claimed task as completed with the commit SHA.",
+      description: "Mark a claimed task as completed with the commit SHA. The originator's role is notified automatically. For extra work-done messages via mesh_send, address the orchestrator's role (e.g. kiro-orchestrator), not an instance id.",
       inputSchema: {
         type: "object",
         properties: {
@@ -215,6 +217,7 @@ async function handleTool(name, args) {
     case "mesh_send": {
       const result = await meshFetch("send", "POST", {
         from: AGENT_ID,
+        base: BASE_ID,
         to: args.to,
         payload: args.payload,
         replyTo: args.replyTo,
@@ -226,7 +229,7 @@ async function handleTool(name, args) {
 
     case "mesh_poll": {
       const result = await meshFetch(
-        `poll?agent=${encodeURIComponent(AGENT_ID)}`,
+        `poll?agent=${encodeURIComponent(AGENT_ID)}&base=${encodeURIComponent(BASE_ID)}`,
         "GET"
       );
       // An E:mesh/update announcement only triggers a re-check; GitHub is the source of truth.
@@ -245,13 +248,14 @@ async function handleTool(name, args) {
     case "mesh_agents": {
       const result = await meshFetch("agents", "GET");
       return {
-        content: [{ type: "text", text: JSON.stringify(result) }],
+        content: [{ type: "text", text: JSON.stringify(summarizeAgents(result)) }],
       };
     }
 
     case "mesh_heartbeat": {
       const result = await meshFetch("agents", "POST", {
         agent: AGENT_ID,
+        base: BASE_ID,
         meta: { ...(args.meta || {}), mcpVersion: LOCAL_VERSION },
       });
       return {
@@ -263,6 +267,7 @@ async function handleTool(name, args) {
       const result = await meshFetch("tasks", "POST", {
         action: "publish",
         from: AGENT_ID,
+        base: BASE_ID,
         repo: args.repo,
         branch: args.branch || "internal-testing",
         specPath: args.specPath || null,
@@ -280,6 +285,7 @@ async function handleTool(name, args) {
         action: "claim",
         id: args.id,
         agent: AGENT_ID,
+        base: BASE_ID,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
@@ -291,6 +297,7 @@ async function handleTool(name, args) {
         action: "complete",
         id: args.id,
         agent: AGENT_ID,
+        base: BASE_ID,
         commitSha: args.commitSha || null,
       });
       return {
@@ -303,6 +310,7 @@ async function handleTool(name, args) {
         action: "fail",
         id: args.id,
         agent: AGENT_ID,
+        base: BASE_ID,
         reason: args.reason || "unknown",
       });
       return {
@@ -330,6 +338,7 @@ async function handleTool(name, args) {
     case "mesh_announce_update": {
       const result = await meshFetch("send", "POST", {
         from: AGENT_ID,
+        base: BASE_ID,
         to: "*",
         payload: `E:mesh/update version=${args.version || LOCAL_VERSION}`,
       });

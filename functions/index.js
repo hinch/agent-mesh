@@ -5,6 +5,7 @@ const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 initializeApp();
+const lib = require("./lib");
 const db = getFirestore();
 
 // Shared secret, stored in Google Cloud Secret Manager.
@@ -53,42 +54,61 @@ exports.send = onRequest(OPTS, async (req, res) => {
 });
 
 /**
- * GET /poll?agent=<id>&since=<iso>
- * Returns unread messages for this agent (including broadcasts)
+ * GET /poll?agent=<instanceId>&base=<baseId>
+ * Returns undelivered messages for this instance:
+ *  - messages addressed to the exact instance id (single `read` flag)
+ *  - messages addressed to its base id (role) or "*" (per-recipient `readBy`)
  */
 exports.poll = onRequest(OPTS, async (req, res) => {
   if (req.method !== "GET") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
-
   const agent = req.query.agent;
   if (!agent) return res.status(400).json({ e: 3 });
-
-  // Get unread messages addressed to this agent or broadcast
-  // Two queries to avoid composite index requirement
-  const [direct, broadcast] = await Promise.all([
+  const base = lib.resolveBase(agent, req.query.base);
+  const now = Date.now();
+  const cutoff = new Date(now - lib.FANOUT_WINDOW_MS);
+  // Polling counts as a heartbeat so fan-out reaches live instances.
+  db.collection("agents")
+    .doc(agent)
+    .set({ agent, base, instance: agent, lastSeen: FieldValue.serverTimestamp() }, { merge: true })
+    .catch(() => {});
+  // Firestore cannot query "array does not contain", so fan-out messages are
+  // fetched over a bounded recent window and filtered in memory.
+  const [direct, fan] = await Promise.all([
     db.collection("messages").where("read", "==", false).where("to", "==", agent).limit(25).get(),
-    db.collection("messages").where("read", "==", false).where("to", "==", "*").limit(25).get(),
+    db
+      .collection("messages")
+      .where("to", "in", [base, "*"])
+      .where("ts", ">=", cutoff)
+      .orderBy("ts", "desc")
+      .limit(lib.FANOUT_LIMIT)
+      .get(),
   ]);
-  const snap = { docs: [...direct.docs, ...broadcast.docs] };
-  snap.forEach = (fn) => snap.docs.forEach(fn);
-
+  const seen = new Set();
   const messages = [];
   const batch = db.batch();
-
-  snap.forEach((doc) => {
+  const handle = (doc) => {
+    if (seen.has(doc.id)) return;
     const d = doc.data();
+    const tsMs = d.ts ? d.ts.toMillis() : null;
+    if (!lib.shouldDeliver(d, agent, base, now, tsMs)) return;
+    seen.add(doc.id);
     messages.push({
       id: doc.id,
       from: d.from,
       to: d.to,
       payload: d.payload,
       replyTo: d.replyTo,
-      ts: d.ts ? d.ts.toDate().toISOString() : null,
+      ts: tsMs ? new Date(tsMs).toISOString() : null,
     });
-    // Mark as read
-    batch.update(doc.ref, { read: true });
-  });
-
+    if (lib.isFanOut(d.to, agent)) {
+      batch.update(doc.ref, { readBy: FieldValue.arrayUnion(agent) });
+    } else {
+      batch.update(doc.ref, { read: true });
+    }
+  };
+  direct.docs.forEach(handle);
+  fan.docs.forEach(handle);
   if (messages.length > 0) await batch.commit();
   res.json({ messages });
 });
@@ -102,13 +122,27 @@ exports.ack = onRequest(OPTS, async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
 
-  const { ids } = req.body;
+  const { ids, agent } = req.body;
   if (!ids || !Array.isArray(ids)) return res.status(400).json({ e: 3 });
-
+  const refs = ids.map((id) => db.collection("messages").doc(String(id)));
   const batch = db.batch();
-  ids.forEach((id) => batch.delete(db.collection("messages").doc(id)));
+  if (typeof agent === "string" && agent && refs.length) {
+    // Instance-scoped ack: exact-instance messages are deleted; role/broadcast
+    // messages are only marked delivered for this instance so others still get them.
+    const docs = await db.getAll(...refs);
+    docs.forEach((doc) => {
+      if (!doc.exists) return;
+      if (lib.isFanOut(doc.data().to, agent)) {
+        batch.update(doc.ref, { readBy: FieldValue.arrayUnion(agent) });
+      } else {
+        batch.delete(doc.ref);
+      }
+    });
+  } else {
+    // Legacy ack without an agent: delete.
+    refs.forEach((ref) => batch.delete(ref));
+  }
   await batch.commit();
-
   res.json({ ok: true });
 });
 
@@ -124,6 +158,7 @@ exports.agents = onRequest(OPTS, async (req, res) => {
   if (req.method === "POST") {
     // Register/heartbeat
     const { agent, meta } = req.body;
+    const base = lib.resolveBase(agent, req.body.base);
     if (!agent) return res.status(400).json({ e: 3 });
     const safeMeta = meta && typeof meta === "object" ? meta : {};
     const mcpVersion =
@@ -132,6 +167,8 @@ exports.agents = onRequest(OPTS, async (req, res) => {
         : null;
     const update = {
       agent,
+      base,
+      instance: agent,
       meta: safeMeta,
       lastSeen: FieldValue.serverTimestamp(),
     };
@@ -141,12 +178,17 @@ exports.agents = onRequest(OPTS, async (req, res) => {
   }
 
   // List agents
+  const now = Date.now();
   const snap = await db.collection("agents").get();
   const agents = [];
   snap.forEach((doc) => {
     const d = doc.data();
+    const lastSeenMs = d.lastSeen ? d.lastSeen.toMillis() : null;
     agents.push({
       agent: d.agent,
+      base: d.base || d.agent,
+      instance: d.instance || d.agent,
+      stale: lib.isStale(lastSeenMs, now),
       meta: d.meta,
       mcpVersion: d.mcpVersion || (d.meta && d.meta.mcpVersion) || null,
       lastSeen: d.lastSeen ? d.lastSeen.toDate().toISOString() : null,
@@ -185,6 +227,7 @@ exports.tasks = onRequest(OPTS, async (req, res) => {
 
       const task = {
         from,
+        fromBase: lib.resolveBase(from, req.body.base),
         repo,
         branch: branch || "internal-testing",
         specPath: specPath || null,
@@ -251,7 +294,7 @@ exports.tasks = onRequest(OPTS, async (req, res) => {
       // Notify the originator
       await db.collection("messages").add({
         from: agent,
-        to: doc.data().from,
+        to: lib.notifyTarget(doc.data()),
         payload: `T:done/${id} sha=${commitSha || "none"};task=${doc.data().taskId}`,
         replyTo: null,
         ts: FieldValue.serverTimestamp(),
@@ -279,7 +322,7 @@ exports.tasks = onRequest(OPTS, async (req, res) => {
       // Notify the originator
       await db.collection("messages").add({
         from: agent,
-        to: doc.data().from,
+        to: lib.notifyTarget(doc.data()),
         payload: `T:fail/${id} reason=${reason || "unknown"};task=${doc.data().taskId}`,
         replyTo: null,
         ts: FieldValue.serverTimestamp(),
@@ -300,6 +343,7 @@ exports.tasks = onRequest(OPTS, async (req, res) => {
         tasks.push({
           id: doc.id,
           from: d.from,
+          fromBase: d.fromBase || d.from,
           repo: d.repo,
           branch: d.branch,
           specPath: d.specPath,
