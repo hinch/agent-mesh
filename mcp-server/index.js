@@ -6,13 +6,20 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const BASE_URL =
-  process.env.MESH_URL ||
-  "https://your-project-id.cloudfunctions.net";
-const MESH_KEY =
-  process.env.MESH_KEY || "REDACTED";
+const BASE_URL = (process.env.MESH_URL || "").replace(/\/+$/, "");
+const MESH_KEY = process.env.MESH_KEY || "";
 const AGENT_ID = process.env.MESH_AGENT_ID || `agent-${Date.now()}`;
 
+const missing = [];
+if (!BASE_URL) missing.push("MESH_URL");
+if (!MESH_KEY) missing.push("MESH_KEY");
+if (missing.length) {
+  console.error(
+    `agent-mesh-mcp: missing required environment variable(s): ${missing.join(", ")}. ` +
+      "Set MESH_URL (your relay base URL) and MESH_KEY (your mesh key) in the MCP server env."
+  );
+  process.exit(1);
+}
 async function meshFetch(endpoint, method, body) {
   const opts = {
     method,
@@ -27,7 +34,7 @@ async function meshFetch(endpoint, method, body) {
 }
 
 const server = new Server(
-  { name: "agent-mesh", version: "1.0.0" },
+  { name: "agent-mesh", version: "1.2.0" },
   { capabilities: { tools: {} } }
 );
 

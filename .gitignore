@@ -1,3 +1,11 @@
-﻿node_modules/
+node_modules/
 .firebase/
 *.log
+.agents-local/
+.firebaserc
+.env
+.env.*
+.secret.local
+*.pem
+*.key
+firebase-debug.log*

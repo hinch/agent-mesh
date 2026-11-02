@@ -1,6 +1,6 @@
 {
   "name": "agent-mesh-mcp",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "MCP server for agent-mesh cross-device messaging",
   "main": "index.js",
   "type": "module",

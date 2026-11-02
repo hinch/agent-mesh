@@ -1,6 +1,6 @@
 {
-  "name": "your-project-id",
-  "version": "1.0.0",
+  "name": "agent-mesh-functions",
+  "version": "1.2.0",
   "description": "Cross-device agent messaging relay",
   "main": "index.js",
   "engines": {

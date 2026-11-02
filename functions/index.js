@@ -1,23 +1,38 @@
+const crypto = require("crypto");
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret, defineString } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 initializeApp();
 const db = getFirestore();
 
-// Auth key - all agents must include this in x-mesh-key header
-const MESH_KEY = "REDACTED";
+// Shared secret, stored in Google Cloud Secret Manager.
+// Set it with: firebase functions:secrets:set MESH_KEY
+const MESH_KEY = defineSecret("MESH_KEY");
 
+// Deployment region. Override at deploy time via the MESH_REGION param
+// (e.g. in functions/.env). Defaults to us-east1.
+const REGION = defineString("MESH_REGION", { default: "us-east1" });
+
+const OPTS = { region: REGION, secrets: [MESH_KEY] };
+
+// Constant-time key comparison. Returns false on missing header or length mismatch.
 function auth(req) {
-  return req.headers["x-mesh-key"] === MESH_KEY;
+  const provided = req.headers["x-mesh-key"];
+  const expected = MESH_KEY.value();
+  if (typeof provided !== "string" || !expected) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
-
 /**
  * POST /send
  * Body: { from: string, to: string, payload: string, replyTo?: string }
  * Sends a message from one agent to another (or broadcast with to:"*")
  */
-exports.send = onRequest({ region: "us-east1" }, async (req, res) => {
+exports.send = onRequest(OPTS, async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
 
@@ -41,7 +56,7 @@ exports.send = onRequest({ region: "us-east1" }, async (req, res) => {
  * GET /poll?agent=<id>&since=<iso>
  * Returns unread messages for this agent (including broadcasts)
  */
-exports.poll = onRequest({ region: "us-east1" }, async (req, res) => {
+exports.poll = onRequest(OPTS, async (req, res) => {
   if (req.method !== "GET") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
 
@@ -83,7 +98,7 @@ exports.poll = onRequest({ region: "us-east1" }, async (req, res) => {
  * Body: { ids: string[] }
  * Explicitly acknowledge/delete messages
  */
-exports.ack = onRequest({ region: "us-east1" }, async (req, res) => {
+exports.ack = onRequest(OPTS, async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
 
@@ -101,7 +116,7 @@ exports.ack = onRequest({ region: "us-east1" }, async (req, res) => {
  * GET /agents
  * Returns list of registered agents and their last heartbeat
  */
-exports.agents = onRequest({ region: "us-east1" }, async (req, res) => {
+exports.agents = onRequest(OPTS, async (req, res) => {
   if (req.method !== "GET" && req.method !== "POST")
     return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
@@ -146,7 +161,7 @@ exports.agents = onRequest({ region: "us-east1" }, async (req, res) => {
  * fail:    { action:"fail", id, agent, reason }
  * list:    { action:"list", status? }  -- optional filter by status
  */
-exports.tasks = onRequest({ region: "us-east1" }, async (req, res) => {
+exports.tasks = onRequest(OPTS, async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ e: 1 });
   if (!auth(req)) return res.status(401).json({ e: 2 });
 
