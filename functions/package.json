@@ -4,7 +4,7 @@
   "description": "Cross-device agent messaging relay",
   "main": "index.js",
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "dependencies": {
     "firebase-admin": "^12.0.0",

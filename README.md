@@ -16,7 +16,7 @@ Cross-device, cross-session messaging and task delegation relay for AI coding ag
 └──────────────┘                                    └──────────────┘
 ```
 
-- **Relay**: Firebase Cloud Functions v2 (Node 20) in `us-east1`
+- **Relay**: Firebase Cloud Functions v2 (Node 22) in `us-east1`
 - **Storage**: Firestore — `messages` collection (message queue), `tasks` collection (task delegation), `agents` collection (registry)
 - **Auth**: Shared API key in `x-mesh-key` header
 - **Transport**: MCP server over stdio (one per Kiro instance)
