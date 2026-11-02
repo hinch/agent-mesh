@@ -125,13 +125,18 @@ exports.agents = onRequest(OPTS, async (req, res) => {
     // Register/heartbeat
     const { agent, meta } = req.body;
     if (!agent) return res.status(400).json({ e: 3 });
-    await db
-      .collection("agents")
-      .doc(agent)
-      .set(
-        { agent, meta: meta || {}, lastSeen: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
+    const safeMeta = meta && typeof meta === "object" ? meta : {};
+    const mcpVersion =
+      typeof safeMeta.mcpVersion === "string"
+        ? safeMeta.mcpVersion.slice(0, 64)
+        : null;
+    const update = {
+      agent,
+      meta: safeMeta,
+      lastSeen: FieldValue.serverTimestamp(),
+    };
+    if (mcpVersion) update.mcpVersion = mcpVersion;
+    await db.collection("agents").doc(agent).set(update, { merge: true });
     return res.json({ ok: true });
   }
 
@@ -143,6 +148,7 @@ exports.agents = onRequest(OPTS, async (req, res) => {
     agents.push({
       agent: d.agent,
       meta: d.meta,
+      mcpVersion: d.mcpVersion || (d.meta && d.meta.mcpVersion) || null,
       lastSeen: d.lastSeen ? d.lastSeen.toDate().toISOString() : null,
     });
   });

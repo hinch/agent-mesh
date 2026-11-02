@@ -37,46 +37,33 @@ You run your own relay in your own Firebase project. There is no shared or hoste
 2. Create a Firestore database (Native mode) in your preferred location.
 3. Upgrade the project to the **Blaze (pay-as-you-go)** plan. Cloud Functions v2 and Secret Manager require billing to be enabled. Usage for a small mesh is typically within the free allowances, but check current pricing and consider setting a budget alert.
 
-### 2. Clone and point at your project
-
+### 2. Clone, install and run setup
 ```bash
-git clone <this-repo-url> agent-mesh
+git clone https://github.com/hinch/agent-mesh.git agent-mesh
 cd agent-mesh
-cp .firebaserc.example .firebaserc
-```
-
-Edit `.firebaserc` and replace `your-project-id` with your Firebase project ID. `.firebaserc` is gitignored so your project ID stays out of version control.
-
-### 3. Generate and store your mesh key
-
-Generate a long random key and store it as a secret. Do not put it in any file in this repo.
-
-```bash
-# Example: generate 32 random bytes as hex
-node -e "console.log('msh_' + require('crypto').randomBytes(32).toString('hex'))"
-
-# Store it in Secret Manager (you will be prompted for the value)
-firebase functions:secrets:set MESH_KEY
-```
-
-### 4. Deploy
-
-```bash
-cd functions
 npm install
-cd ..
-firebase deploy --only functions,firestore
+npm run setup
 ```
+`npm run setup` checks that the Firebase CLI is installed and logged in, asks for your project ID and region (default `us-east1`), writes a local untracked `.firebaserc` and `functions/.env`, generates a fresh key on your machine, stores it in Secret Manager (piped over stdin, never on a command line or in a file), deploys the functions and Firestore rules, and prints a ready-to-paste MCP config block. It can optionally merge that block into `~/.kiro/settings/mcp.json`. It refuses to write the key anywhere inside the repo.
 
-Optional: to deploy to a different region, create `functions/.env` containing `MESH_REGION=<region>` before deploying. The default is `us-east1`.
-
-After deployment, your base URL is:
-
+For non-interactive use (for example from an agent):
+```bash
+npm run setup -- --project <your-project-id> --region us-east1 --agent-id agent-1 --yes
 ```
-https://<region>-<your-project-id>.cloudfunctions.net
-```
+Run `node scripts/setup.js --help` for all flags. Each deployment has its own key, generated locally; there is no shared key and nothing key-related is in this repository.
 
+The base URL it computes is `https://<region>-<your-project-id>.cloudfunctions.net`.
+
+### 3. Other machines
+`npm run show-config -- --project <your-project-id>` reads the key from Secret Manager (`firebase functions:secrets:access`) and prints the config block for adding another machine.
+
+### 4. Install the MCP server on each agent machine
+```bash
+cd mcp-server
+npm install
+```
 ### 5. Configure each agent (MCP)
+Paste the block printed by setup into each agent's MCP config (for example mcp.json), adjusting the path to mcp-server/index.js for that machine. Its shape:
 
 ```bash
 cd mcp-server
@@ -102,6 +89,8 @@ Add the server to your agent's MCP config (for example `mcp.json`):
         "mesh_poll",
         "mesh_agents",
         "mesh_heartbeat",
+        "mesh_version",
+        "mesh_announce_update",
         "mesh_task_publish",
         "mesh_task_claim",
         "mesh_task_complete",
@@ -122,23 +111,20 @@ Each agent needs a unique `MESH_AGENT_ID` (for example `agent-1`, `agent-2`, `ci
 From an agent, call `mesh_heartbeat` to register, then `mesh_agents` to list registered agents and `mesh_poll` to check for messages.
 
 ## Key rotation
-
 Rotate the key if it may have been exposed, and periodically as routine hygiene.
-
 ```bash
-# 1. Generate a new key and set it as a new secret version
-node -e "console.log('msh_' + require('crypto').randomBytes(32).toString('hex'))"
-firebase functions:secrets:set MESH_KEY
-
-# 2. Redeploy so the functions pick up the new version
-firebase deploy --only functions
-
-# 3. Optionally destroy old versions
-firebase functions:secrets:destroy MESH_KEY@<old-version>
+npm run rotate-key -- --project <your-project-id>
 ```
+This generates a new key locally, sets it as a new secret version, redeploys the functions and prints an updated config block. **Every agent must update `MESH_KEY` in its MCP config and restart**; until they do they receive `401` responses. Optionally destroy old secret versions with `firebase functions:secrets:destroy MESH_KEY@<old-version>`.
 
-Then update `MESH_KEY` in every agent's MCP config and restart the agents. Until they are updated, they will receive `401` responses.
+## Versions and updates
+Each MCP server reports its version (from `mcp-server/package.json`) in its heartbeat as `meta.mcpVersion`. The relay stores it and `/agents` returns it, so `mesh_agents` shows the version of every agent.
 
+The MCP server checks GitHub for the latest version at startup and then at most every 6 hours (cached in memory). It uses the repo's tags, falling back to `mcp-server/package.json` on the default branch, with a short timeout. Failures (private repo, offline) are silent and never affect tool calls. When the local version is behind, a short notice is appended to every mesh tool result: run `git pull && npm install` in the agent-mesh repo (and in `mcp-server`), then restart the MCP server.
+
+- `mesh_version` reports the local version, the latest known version and the update status, and forces a re-check.
+- `mesh_announce_update` broadcasts `E:mesh/update version=<v>` to all agents. When `mesh_poll` receives it, the agent re-checks GitHub immediately. GitHub is the source of truth; announcements only trigger checks.
+- Forks: set `MESH_UPDATE_REPO=<owner>/<repo>` in the MCP server env to check your fork instead of the default `hinch/agent-mesh`.
 ## API endpoints
 
 All requests require the header `x-mesh-key: <your-mesh-key>`.
@@ -159,6 +145,8 @@ All requests require the header `x-mesh-key: <your-mesh-key>`.
 | `mesh_poll` | Check for new messages addressed to this agent |
 | `mesh_agents` | List all registered agents on the mesh |
 | `mesh_heartbeat` | Register this agent and report metadata |
+| `mesh_version` | Report local and latest version, force an update re-check |
+| `mesh_announce_update` | Broadcast `E:mesh/update` so agents re-check for updates |
 | `mesh_task_publish` | Publish a task for any idle agent to claim |
 | `mesh_task_claim` | Atomically claim an open task |
 | `mesh_task_complete` | Mark a task done with a commit SHA |

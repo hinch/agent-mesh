@@ -5,6 +5,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
+import { createUpdateChecker, DEFAULT_UPDATE_REPO } from "./version.js";
+
+const LOCAL_VERSION = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf8")
+).version;
+const UPDATE_REPO = process.env.MESH_UPDATE_REPO || DEFAULT_UPDATE_REPO;
+const updates = createUpdateChecker({ localVersion: LOCAL_VERSION, repo: UPDATE_REPO });
 
 const BASE_URL = (process.env.MESH_URL || "").replace(/\/+$/, "");
 const MESH_KEY = process.env.MESH_KEY || "";
@@ -34,7 +42,7 @@ async function meshFetch(endpoint, method, body) {
 }
 
 const server = new Server(
-  { name: "agent-mesh", version: "1.2.0" },
+  { name: "agent-mesh", version: LOCAL_VERSION },
   { capabilities: { tools: {} } }
 );
 
@@ -181,11 +189,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "mesh_version",
+      description:
+        "Report this MCP server version, the latest known version on GitHub, and update status. Forces a re-check.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "mesh_announce_update",
+      description:
+        "Broadcast E:mesh/update to all agents so they re-check GitHub for a new version.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          version: { type: "string", description: "Version being announced (defaults to local version)" },
+        },
+      },
+    },
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+async function handleTool(name, args) {
 
   switch (name) {
     case "mesh_send": {
@@ -205,6 +229,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `poll?agent=${encodeURIComponent(AGENT_ID)}`,
         "GET"
       );
+      // An E:mesh/update announcement only triggers a re-check; GitHub is the source of truth.
+      if (
+        result &&
+        Array.isArray(result.messages) &&
+        result.messages.some((m) => typeof m.payload === "string" && m.payload.startsWith("E:mesh/update"))
+      ) {
+        await updates.check(true);
+      }
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
       };
@@ -220,7 +252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "mesh_heartbeat": {
       const result = await meshFetch("agents", "POST", {
         agent: AGENT_ID,
-        meta: args.meta || {},
+        meta: { ...(args.meta || {}), mcpVersion: LOCAL_VERSION },
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
@@ -288,17 +320,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
+    case "mesh_version": {
+      await updates.check(true);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ...updates.status(), repo: UPDATE_REPO }) }],
+      };
+    }
+
+    case "mesh_announce_update": {
+      const result = await meshFetch("send", "POST", {
+        from: AGENT_ID,
+        to: "*",
+        payload: `E:mesh/update version=${args.version || LOCAL_VERSION}`,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    }
+
     default:
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true,
       };
   }
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: rawArgs } = request.params;
+  const result = await handleTool(name, rawArgs || {});
+  const notice = updates.notice();
+  if (notice && name !== "mesh_version" && Array.isArray(result.content)) {
+    result.content.push({ type: "text", text: notice.trim() });
+  }
+  return result;
 });
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Startup check, fire-and-forget; failures are silent.
+  updates.check(true).catch(() => {});
 }
 
 main().catch(console.error);
