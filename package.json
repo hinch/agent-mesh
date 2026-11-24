@@ -1,6 +1,6 @@
 {
   "name": "agent-mesh",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "license": "MIT",
   "private": true,
   "description": "Self-hosted cross-device agent messaging relay",

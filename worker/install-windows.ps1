@@ -17,7 +17,7 @@ if ($Uninstall) {
 $cfg = (Resolve-Path $Config).Path
 $worker = (Resolve-Path (Join-Path $PSScriptRoot "mesh-worker.mjs")).Path
 $node = (Get-Command node -ErrorAction Stop).Source
-$logDir = Join-Path $env:USERPROFILE ".agent-mesh\worker"
+$logDir = Join-Path $env:USERPROFILE (".agent-mesh\keepalive\" + ($Name -replace '[^A-Za-z0-9_-]', '_'))
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # The keepalive starts the worker hidden when no node process runs it with this config.
@@ -30,12 +30,12 @@ if (-not `$running) {
 }
 "@ | Set-Content -Encoding UTF8 $keep
 
+# Every 5 minutes, as the current user, only while logged on: needs no admin rights
+# (a logon trigger would). After a reboot it starts within 5 minutes of logging on.
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$keep`""
-$triggers = @(
-  (New-ScheduledTaskTrigger -AtLogOn),
-  (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5))
-)
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName "$Name keepalive" -Action $action -Trigger $triggers -Settings $settings -Force | Out-Null
+Register-ScheduledTask -TaskName "$Name keepalive" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName "$Name keepalive"
-Write-Output "Installed '$Name keepalive' (every 5 min + at logon). Logs: $logDir"
+Write-Output "Installed '$Name keepalive' (every 5 min while you are logged on). Logs: $logDir"
