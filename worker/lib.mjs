@@ -40,6 +40,11 @@ export function pickTasks(tasks, freeSlots, declined = [], opts = {}) {
   return out;
 }
 
+/** True when the task's `requires` names a capability that needs a device of its own. */
+export function needsDevice(task, deviceRequires = ["emulator"]) {
+  return Array.isArray(task?.requires) && task.requires.some((r) => deviceRequires.includes(r));
+}
+
 /**
  * Mesh URL + key: MESH_URL / MESH_KEY from the environment win; otherwise the
  * "agent-mesh" entry of an MCP config file (Kiro / Claude Code format).
@@ -69,6 +74,11 @@ export function buildPrompt(kind, ctx) {
       `When done call mesh_task_complete with id "${t.id}" and the commit SHA, then mesh_send a short work-done note to the publisher ROLE "${t.fromBase || t.from}" (never to an instance id).`,
       `If you cannot finish, call mesh_task_fail with id "${t.id}" and a precise reason (or mesh_task_release to give it back).`,
       "Your mesh calls renew the claim lease; the worker also renews it while you run.",
+      ...(ctx.device
+        ? [
+            `DEVICE: the worker holds the lock for device "${ctx.device}" for this run and releases it when you exit. Use only that serial (ANDROID_SERIAL is set; adb -s ${ctx.device}). Do not take, wait for or release device locks yourself, and do not touch another serial.`,
+          ]
+        : []),
       "",
       "```json",
       JSON.stringify(t, null, 2),

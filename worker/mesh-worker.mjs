@@ -7,7 +7,9 @@
 //    (more slots = more parallel requests = more tokens per second from this machine);
 //  - batches incoming messages for the role into one "inbox" agent run at a time;
 //  - keeps task leases alive while a run is going and gives a task back to the queue
-//    (or fails it after `maxAttempts`) when a run ends without closing it.
+//    (or fails it after `maxAttempts`) when a run ends without closing it;
+//  - owns the device locks (`devices` in the config): takes one per device task before the
+//    run and releases it when the run ends, however it ends (worker/devices.mjs).
 //
 // Usage: node mesh-worker.mjs --config <path/to/worker.json> [--once]
 // Config reference: worker/worker.example.json and the "Worker daemon" section of README.md.
@@ -18,7 +20,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { buildPrompt, expandArgs, nextBackoffMs, pickTasks, loadSecrets, slotInstance } from "./lib.mjs";
+import { buildPrompt, expandArgs, needsDevice, nextBackoffMs, pickTasks, loadSecrets, slotInstance } from "./lib.mjs";
+import { acquireDevice, releaseDevice, touchDevice, DEFAULT_STALE_MINUTES } from "./devices.mjs";
 
 const argv = process.argv.slice(2);
 const cfgPath = argv[argv.indexOf("--config") + 1];
@@ -45,12 +48,19 @@ const MAX_ATTEMPTS = Math.max(1, Number(cfg.maxAttempts ?? 2));
 const RUN_TIMEOUT_MS = Math.max(5, Number(cfg.runTimeoutMinutes ?? 90)) * 60_000;
 const HEARTBEAT_MS = 5 * 60_000;
 const INBOX_ENABLED = cfg.inbox?.enabled !== false;
+// Device pool: tasks that require one of DEVICE_REQUIRES get a serial of their own for the run.
+const DEVICE_SERIALS = Array.isArray(cfg.devices?.serials) ? cfg.devices.serials.filter(Boolean) : [];
+const DEVICE_REQUIRES = Array.isArray(cfg.devices?.requires) ? cfg.devices.requires : ["emulator"];
+const DEVICE_DIR = rel(cfg.devices?.lockDir || path.join(os.homedir(), ".agent-mesh", "locks"));
+const DEVICE_STALE_MIN = Math.max(1, Number(cfg.devices?.staleMinutes ?? DEFAULT_STALE_MINUTES));
+const DEVICE_BEAT_MS = 60_000;
 fs.mkdirSync(RUNS, { recursive: true });
 
 const secrets = loadSecrets(process.env, cfg.meshConfig ? rel(cfg.meshConfig) : null);
 const state = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, "utf8")) : { attempts: {}, declined: [], pendingMessages: [] };
 const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 2));
 const slots = new Map(); // slotNo -> { taskId, pid, since, log }
+const held = new Map(); // device serial -> { token, taskId, instance, timer }
 let inboxRun = null;
 const passedOver = new Map(); // task id -> skip until (ms)
 let stopping = false;
@@ -82,6 +92,42 @@ const heartbeat = (instance, busy) =>
     meta: { host: os.hostname(), capabilities: CAPS, slots: instance === NAME ? SLOTS : 1, busy, worker: true, mcpVersion: "worker" },
   }).catch((e) => log("heartbeat failed", e.message));
 
+/** Lock a free device for a task, or null when all are in use. Stale locks are broken. */
+function takeDevice(instance, task) {
+  const got = acquireDevice({
+    dir: DEVICE_DIR,
+    serials: DEVICE_SERIALS,
+    owner: { instance, taskId: task.id, task: task.taskId },
+    ctx: {
+      staleMinutes: DEVICE_STALE_MIN,
+      workerPid: process.pid,
+      holds: (o) => held.get(o.serial)?.taskId === o.taskId,
+    },
+  });
+  if (!got) return null;
+  if (got.broke) log(`device ${got.serial}: broke a stale lock (${got.broke})`);
+  const timer = setInterval(() => {
+    if (!touchDevice({ dir: DEVICE_DIR, serial: got.serial, token: got.token })) log(`device ${got.serial}: lock is no longer ours`);
+  }, DEVICE_BEAT_MS);
+  timer.unref();
+  held.set(got.serial, { token: got.token, taskId: task.id, instance, timer });
+  return got.serial;
+}
+
+/** Release a device lock. Safe to call twice and with null. */
+function dropDevice(serial) {
+  const h = serial && held.get(serial);
+  if (!h) return;
+  clearInterval(h.timer);
+  held.delete(serial);
+  try {
+    if (releaseDevice({ dir: DEVICE_DIR, serial, token: h.token })) log(`device ${serial}: released`);
+    else log(`device ${serial}: lock was taken over, left alone`);
+  } catch (e) {
+    log(`device ${serial}: release failed: ${e.message}`);
+  }
+}
+
 function writeMcpConfig(instance, stamp) {
   const file = path.join(os.tmpdir(), `mesh-worker-${stamp}-${process.pid}.json`);
   const mcp = cfg.agent?.mcpServer || { command: "node", args: [rel(cfg.mcpServerPath || path.join(cfgDir, "..", "mcp-server", "index.js"))] };
@@ -107,7 +153,7 @@ function writeMcpConfig(instance, stamp) {
   return file;
 }
 
-function runAgent({ kind, instance, prompt, instructions, cwd, onExit }) {
+function runAgent({ kind, instance, prompt, instructions, cwd, env, onExit }) {
   const stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}-${kind}`;
   const logFile = path.join(RUNS, `${stamp}.log`);
   const mcpFile = writeMcpConfig(instance, stamp);
@@ -121,7 +167,7 @@ function runAgent({ kind, instance, prompt, instructions, cwd, onExit }) {
     cwd: rel(cwd || cfg.cwd || process.cwd()),
     stdio: ["pipe", out, out],
     windowsHide: true,
-    env: { ...process.env, MESH_INSTANCE_ID: instance, MESH_ROLE: ROLE },
+    env: { ...process.env, MESH_INSTANCE_ID: instance, MESH_ROLE: ROLE, ...env },
   });
   child.stdin.on("error", () => {});
   child.stdin.end(prompt);
@@ -129,10 +175,11 @@ function runAgent({ kind, instance, prompt, instructions, cwd, onExit }) {
     fs.writeSync(out, "\n# timeout, killing\n");
     child.kill();
   }, RUN_TIMEOUT_MS);
-  child.on("error", (e) => {
-    fs.writeSync(out, `\n# spawn error ${e.message}\n`);
-  });
-  child.on("exit", (code) => {
+  // A failed spawn emits "error" and no "exit": either one ends the run, once.
+  let ended = false;
+  const end = (code) => {
+    if (ended) return;
+    ended = true;
     clearTimeout(timer);
     try {
       fs.writeSync(out, `\n# exit ${code}\n`);
@@ -142,7 +189,14 @@ function runAgent({ kind, instance, prompt, instructions, cwd, onExit }) {
       fs.unlinkSync(mcpFile);
     } catch {}
     onExit(code, logFile);
+  };
+  child.on("error", (e) => {
+    try {
+      fs.writeSync(out, `\n# spawn error ${e.message}\n`);
+    } catch {}
+    end(-1);
   });
+  child.on("exit", end);
   return { pid: child.pid, since: stamp, log: logFile };
 }
 
@@ -154,23 +208,41 @@ async function taskStatus(id) {
 
 async function startTask(slotNo, task) {
   const instance = slotInstance(NAME, slotNo);
-  await heartbeat(instance, 1);
-  const claim = await relay("tasks", "POST", { action: "claim", id: task.id, agent: instance, base: ROLE });
+  // The device lock comes first, so a task is never claimed and then left waiting for a device.
+  let device = null;
+  if (DEVICE_SERIALS.length && needsDevice(task, DEVICE_REQUIRES)) {
+    device = takeDevice(instance, task);
+    if (!device) {
+      log(`slot ${slotNo}: no free device for ${task.id} (${task.taskId}), left in the queue`);
+      return "no-device";
+    }
+  }
+  let claim;
+  try {
+    await heartbeat(instance, 1);
+    claim = await relay("tasks", "POST", { action: "claim", id: task.id, agent: instance, base: ROLE });
+  } catch (e) {
+    dropDevice(device);
+    throw e;
+  }
   if (claim.status !== 200) {
+    dropDevice(device);
     log(`claim ${task.id} (${task.taskId}) refused: ${claim.status} ${claim.json.msg || ""}`);
     if (claim.status === 412 || claim.status === 403) state.declined.push(task.id);
     save();
     return false;
   }
-  log(`slot ${slotNo}: claimed ${task.id} (${task.taskId})`);
-  const prompt = buildPrompt("task", { task, instance, role: ROLE, slot: slotNo, attempt: (state.attempts[task.id] || 0) + 1 });
+  log(`slot ${slotNo}: claimed ${task.id} (${task.taskId})${device ? ` with device ${device}` : ""}`);
+  const prompt = buildPrompt("task", { task, instance, role: ROLE, slot: slotNo, attempt: (state.attempts[task.id] || 0) + 1, device });
   const run = runAgent({
     kind: `task-s${slotNo}`,
     instance,
     prompt,
     instructions: cfg.task?.instructionsFile,
     cwd: cfg.task?.cwd,
+    env: device ? { ANDROID_SERIAL: device, MESH_DEVICE_SERIAL: device } : undefined,
     onExit: async (code, logFile) => {
+      dropDevice(device); // first, and whatever the exit reason: crash, timeout, failed spawn
       slots.delete(slotNo);
       state.attempts[task.id] = (state.attempts[task.id] || 0) + 1;
       save();
@@ -197,7 +269,8 @@ async function startTask(slotNo, task) {
       kick();
     },
   });
-  slots.set(slotNo, { taskId: task.id, task: task.taskId, ...run });
+  slots.set(slotNo, { taskId: task.id, task: task.taskId, ...(device ? { device } : {}), ...run });
+  if (device && held.has(device)) touchDevice({ dir: DEVICE_DIR, serial: device, token: held.get(device).token, extra: { agentPid: run.pid } });
   return true;
 }
 
@@ -240,6 +313,7 @@ function writeStatus(extra) {
         role: ROLE,
         capabilities: CAPS,
         slots: SLOTS,
+        devices: DEVICE_SERIALS.map((serial) => ({ serial, heldFor: held.get(serial)?.taskId || null })),
         running: [...slots.entries()].map(([n, s]) => ({ slot: n, ...s })),
         inbox: inboxRun,
         queuedMessages: state.pendingMessages.length,
@@ -285,7 +359,9 @@ async function cycle() {
     const pickedIds = new Set(picked.map(([, t]) => t.id));
     if (picked.length < free.length) for (const t of offered) if (!pickedIds.has(t.id)) passedOver.set(t.id, now + 30 * 60_000);
     for (const [slotNo, task] of picked) {
-      await startTask(slotNo, task).catch((e) => log(`start ${task.id} failed: ${e.message}`));
+      const started = await startTask(slotNo, task).catch((e) => log(`start ${task.id} failed: ${e.message}`));
+      // All devices busy: offer the task again in a minute (another machine may take it sooner).
+      if (started === "no-device") passedOver.set(task.id, Date.now() + 60_000);
     }
     if (state.declined.length > 200) state.declined = state.declined.slice(-200);
     if (Date.now() >= (state.inboxRetryAfter || 0)) startInbox();
@@ -295,6 +371,7 @@ async function cycle() {
 
 async function main() {
   log(`worker ${NAME} role=${ROLE} slots=${SLOTS} caps=[${CAPS.join(",")}] state=${STATE_DIR}`);
+  if (DEVICE_SERIALS.length) log(`devices [${DEVICE_SERIALS.join(",")}] for requires [${DEVICE_REQUIRES.join(",")}] locks=${DEVICE_DIR}`);
   await heartbeat(NAME, 0);
   let lastBeat = Date.now();
   const beat = setInterval(() => {
