@@ -1,39 +1,38 @@
 {
-    "indexes":  [
-                    {
-                        "collectionGroup":  "messages",
-                        "queryScope":  "COLLECTION",
-                        "fields":  [
-                                       {
-                                           "fieldPath":  "read",
-                                           "order":  "ASCENDING"
-                                       },
-                                       {
-                                           "fieldPath":  "to",
-                                           "order":  "ASCENDING"
-                                       },
-                                       {
-                                           "fieldPath":  "ts",
-                                           "order":  "ASCENDING"
-                                       }
-                                   ]
-                    },
-                    {
-                        "collectionGroup":  "messages",
-                        "queryScope":  "COLLECTION",
-                        "fields":  [
-                                       {
-                                           "fieldPath":  "to",
-                                           "order":  "ASCENDING"
-                                       },
-                                       {
-                                           "fieldPath":  "ts",
-                                           "order":  "DESCENDING"
-                                       }
-                                   ]
-                    }
-                ],
-    "fieldOverrides":  [
-
-                       ]
+  "indexes": [
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "read", "order": "ASCENDING" },
+        { "fieldPath": "to", "order": "ASCENDING" },
+        { "fieldPath": "ts", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "to", "order": "ASCENDING" },
+        { "fieldPath": "ts", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "to", "order": "ASCENDING" },
+        { "fieldPath": "ts", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "tasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "claimedBy", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
 }

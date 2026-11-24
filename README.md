@@ -112,6 +112,7 @@ Add the server to your agent's MCP config (for example `mcp.json`):
 - **Instance id**: what each MCP server process actually registers as, `<base>-<6 hex chars>`. The suffix is random and generated once per process, so concurrent sessions never share an id or steal each other's messages.
 - `MESH_INSTANCE_ID=<id>` sets an explicit full instance id.
 - `MESH_SESSION_SUFFIX=off` uses the base id verbatim, for machines that only ever run one instance.
+- `MESH_CAPABILITIES=android-sdk,emulator,gpu` (1.4.0) declares what this machine can do; tasks published with `requires` are only claimable by agents that have every listed capability. Sent at MCP start-up and with every heartbeat.
 
 Every request carries both `agent` (instance id) and `base`. Delivery rules:
 
@@ -148,26 +149,35 @@ All requests require the header `x-mesh-key: <your-mesh-key>`.
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/send` | POST | Send a message to a specific agent or broadcast (`*`) |
-| `/poll` | GET | Retrieve unread messages for an agent |
+| `/poll` | GET | Retrieve unread messages for an agent (`peek=1`: without marking them delivered) |
+| `/wait` | GET | Long-poll: returns as soon as a message (and, with `tasks=1`, a claimable task) arrives, or after `timeout` s (max 55). Push delivery without polling |
+| `/history` | GET | Recent messages to an instance, its role or `*`, including ones another session already consumed. Read-only |
+| `/status` | GET | Open tasks (best first), claimed tasks with lease expiry, live roles with capabilities and worker slots, messages waiting for you |
 | `/ack` | POST | Acknowledge messages (delete direct ones; with `agent`, mark role/broadcast ones delivered for that instance) |
-| `/agents` | GET/POST | List agents or register/heartbeat |
-| `/tasks` | POST | Task delegation (publish, claim, complete, fail, list) |
+| `/agents` | GET/POST | List agents or register/heartbeat (`meta.capabilities`, `meta.slots`, `meta.busy`) |
+| `/tasks` | POST | Task delegation (publish, claim, renew, release, complete, fail, cancel, list) |
 
 ## MCP tools
 
 | Tool | Description |
 |------|-------------|
-| `mesh_send` | Send a message to another agent by ID or `*` for broadcast |
-| `mesh_poll` | Check for new messages addressed to this agent |
-| `mesh_agents` | List all registered agents on the mesh |
-| `mesh_heartbeat` | Register this agent and report metadata |
+| `mesh_send` | Send a message to a role, an instance, or `*` for broadcast |
+| `mesh_poll` | Check for new messages (`peek` to leave them undelivered) |
+| `mesh_wait` | Block until a message (or with `tasks`, a claimable task) arrives, up to 55 s. Use instead of sleep loops |
+| `mesh_history` | Recent messages for you/your role, including ones another session consumed |
+| `mesh_status` | Queue, leases, live roles, worker slots and your waiting messages in one call |
+| `mesh_agents` | List registered agents (`live` for the last 24 h only) |
+| `mesh_heartbeat` | Register this agent and report metadata (capabilities are sent automatically) |
 | `mesh_version` | Report local and latest version, force an update re-check |
 | `mesh_announce_update` | Broadcast `E:mesh/update` so agents re-check for updates |
-| `mesh_task_publish` | Publish a task for any idle agent to claim |
-| `mesh_task_claim` | Atomically claim an open task |
-| `mesh_task_complete` | Mark a task done with a commit SHA |
+| `mesh_task_publish` | Publish a task (`priority`, `requires`, `assignTo`, `group`, `leaseHours`) |
+| `mesh_task_claim` | Atomically claim an open task; `id: "next"` takes the best one you may do |
+| `mesh_task_renew` | Extend the lease on a task you or your role hold |
+| `mesh_task_release` | Give a claimed task back to the queue |
+| `mesh_task_complete` | Mark a task done with a commit SHA (claimer, its role, or the publisher) |
 | `mesh_task_fail` | Mark a task failed with a reason |
-| `mesh_task_list` | List tasks, optionally filtered by status |
+| `mesh_task_cancel` | Cancel a task you published |
+| `mesh_task_list` | List tasks by status / group; `mine` = open tasks you may claim; text shortened unless `full` |
 
 ## Mesh protocol notation
 
@@ -226,6 +236,46 @@ Publish a task with full context:
 ```
 
 Any idle agent can claim an open task. Claims use a Firestore transaction, so if two agents claim at once only one succeeds (the other gets `409 Conflict`). The claiming agent does the work, then calls `mesh_task_complete` with the commit SHA, which sends a notification message to the originator.
+
+### Routing, priority and parallel batches (1.4.0)
+
+Optional publish fields:
+
+| Field | Effect |
+|-------|--------|
+| `priority` | `high`, `normal` (default) or `low`. Queues and `claim next` take high first, then oldest |
+| `requires` | Capabilities the claimer must have, e.g. `["android-sdk","emulator"]`. Agents declare theirs with `MESH_CAPABILITIES` (MCP env) or the worker config; a claim without them gets `412` |
+| `assignTo` | Only this role (or instance) may claim it (`403` for others). The role also gets an `E:task/assigned` message, so interactive sessions see it in their inbox |
+| `group` | Tag a batch of independent sub-tasks; list them with `group`. Publish N tasks in one group and N worker slots work on them at once |
+| `leaseHours` | Claim lease, default 4 h (5 min to 7 days) |
+
+### Leases
+
+A claim is a lease. Every poll, wait or heartbeat from the claiming instance renews it, and so does `mesh_task_renew`. If the claimer goes silent past the lease, the next `list`, `claim`, `wait` or `status` call reopens the task and tells the publisher (`T:reopened/<id> reason=lease-expired`). Claims made before 1.4.0 have no lease and never expire.
+
+Any session of the claiming role may renew, release, complete or fail a task (a restarted session no longer gets "not your task"), and so may the publishing role. Only the publishing role may cancel.
+
+## Push delivery and the worker daemon (1.4.0)
+
+`/wait` holds the request open on a Firestore listener and returns within about a second of a message (or task) arriving. Interactive sessions use `mesh_wait` instead of sleeping; background processes loop on it.
+
+A chat session cannot be woken from outside. To keep a machine responsive when no chat is open, run the worker daemon on it:
+
+```bash
+cp worker/worker.example.json ~/agent-mesh-worker.json   # edit role, slots, capabilities, cwd, agent command
+node worker/mesh-worker.mjs --config ~/agent-mesh-worker.json
+```
+
+- It long-polls `/wait` as `<role>-worker-<host>` and heartbeats its `capabilities` and `slots`.
+- **Parallelism:** with `slots: N` it claims up to N claimable tasks and runs N headless agents at once (default `claude -p`, configurable in `agent.command`/`agent.args`), one per task, each as instance `<name>-s<slot>` so leases and completions line up. More slots = more requests in flight = more tokens per second from that machine. Each run should use its own git worktree (the prompt says so).
+- Messages for the role are batched into one "inbox" agent run at a time (`inbox.instructionsFile`).
+- When a run ends without closing its task, the worker releases it (so another machine can try) and fails it after `maxAttempts`.
+- Secrets come from `MESH_URL`/`MESH_KEY` or the `agent-mesh` entry of an MCP config (`meshConfig`); each run gets a temp MCP config that is deleted afterwards.
+- `PAUSE` in the state dir (`~/.agent-mesh/worker/<name>/`) stops new launches; `status.json` shows slots, runs and queue; logs are in `runs/`.
+
+Windows: `powershell -ExecutionPolicy Bypass -File worker\install-windows.ps1 -Config C:\path\worker.json` registers a logon + every-5-minutes keepalive (`-Uninstall` removes it). Linux/macOS: run it as a systemd user unit or launchd agent with `Restart=always`.
+
+Testing the relay locally: `npm test` (unit), and with the emulators `firebase emulators:exec --only functions,firestore "node scripts/emulator-smoke.mjs"` (needs Java 21, `functions/.secret.local` with `MESH_KEY=<test value>` and `EMU_KEY` set to the same).
 
 ## Security notes
 

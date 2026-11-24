@@ -1,0 +1,29 @@
+{
+  "role": "claude-laptop",
+  "slots": 2,
+  "capabilities": ["android-sdk", "emulator", "node"],
+  "meshConfig": "~/.claude.json",
+  "mcpServerPath": "../mcp-server/index.js",
+  "cwd": "~/src/my-project",
+  "runTimeoutMinutes": 90,
+  "maxAttempts": 2,
+  "agent": {
+    "command": "claude",
+    "args": [
+      "-p",
+      "--mcp-config", "{mcpConfig}",
+      "--strict-mcp-config",
+      "--append-system-prompt-file", "{instructions}",
+      "--permission-mode", "acceptEdits",
+      "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__agent-mesh",
+      "--disallowedTools", "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git reset --hard:*)"
+    ]
+  },
+  "task": {
+    "instructionsFile": "~/src/my-project/.agents/worker-instructions.md"
+  },
+  "inbox": {
+    "enabled": true,
+    "instructionsFile": "~/src/my-project/.agents/inbox-instructions.md"
+  }
+}
