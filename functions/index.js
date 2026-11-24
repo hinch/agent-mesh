@@ -303,24 +303,37 @@ exports.wait = onRequest(WAIT_OPTS, async (req, res) => {
         recheck();
       }
     };
-    const timer = setTimeout(() => finish({ messages: [], tasks: [] }), timeoutS * 1000);
+    // At the deadline, look once more so nothing that raced the listener is missed.
+    const timer = setTimeout(async () => {
+      try {
+        const r = await check();
+        finish(r);
+      } catch {
+        finish({ messages: [], tasks: [] });
+      }
+    }, timeoutS * 1000);
     req.on("close", () => finish({ messages: [], tasks: [] }));
+    // If a listener fails (e.g. quota, index), fall back to a short recheck loop.
+    let fallback = null;
+    const onListenError = () => {
+      if (!fallback && !done) {
+        fallback = setInterval(recheck, 5000);
+        unsubs.push(() => clearInterval(fallback));
+      }
+    };
+    const targets = new Set([agent, base, "*"]);
     const since = Timestamp.fromMillis(started - 5000);
-    let first = true;
+    // Listen on ts only (automatic single-field index) and filter recipients in memory,
+    // so push delivery never depends on a composite index being built.
     unsubs.push(
       db
         .collection("messages")
-        .where("to", "in", [agent, base, "*"])
         .where("ts", ">=", since)
         .onSnapshot(
           (snap) => {
-            if (first) {
-              first = false;
-              if (snap.empty) return;
-            }
-            if (snap.docChanges().some((c) => c.type === "added" || c.type === "modified")) recheck();
+            if (snap.docChanges().some((c) => (c.type === "added" || c.type === "modified") && targets.has(c.doc.data().to))) recheck();
           },
-          () => {},
+          onListenError,
         ),
     );
     if (wantTasks) {
@@ -337,7 +350,7 @@ exports.wait = onRequest(WAIT_OPTS, async (req, res) => {
               }
               if (snap.docChanges().some((c) => c.type === "added")) recheck();
             },
-            () => {},
+            onListenError,
           ),
       );
     }

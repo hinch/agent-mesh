@@ -1,6 +1,6 @@
 {
   "name": "agent-mesh-mcp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "license": "MIT",
   "description": "MCP server for agent-mesh cross-device messaging",
   "main": "index.js",
