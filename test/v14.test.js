@@ -78,6 +78,8 @@ test("worker helpers: slots, args, backoff, picking, secrets, prompts", async ()
   const picked = w.pickTasks([{ id: "a" }, { id: "b" }, { id: "a" }, { id: "c" }], [1, 3], ["b"]);
   assert.deepStrictEqual(picked.map(([s, t]) => [s, t.id]), [[1, "a"], [3, "c"]]);
   assert.deepStrictEqual(w.pickTasks([{ id: "a" }], [], []), []);
+  const routed = w.pickTasks([{ id: "u" }, { id: "x", assignTo: "other" }, { id: "m", assignTo: "desk" }], [1, 2], [], { acceptUnassigned: false, role: "desk", name: "desk-worker-h" });
+  assert.deepStrictEqual(routed.map(([, t]) => t.id), ["m"]);
   assert.deepStrictEqual(w.loadSecrets({ MESH_URL: "https://x/", MESH_KEY: "k" }, null), { url: "https://x", key: "k" });
   assert.throws(() => w.loadSecrets({}, null), /required/);
   const p = w.buildPrompt("task", { task: { id: "T1", taskId: "WP1", fromBase: "orch" }, instance: "lap-s1", role: "lap", slot: 1, attempt: 1 });

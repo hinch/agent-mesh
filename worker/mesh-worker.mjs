@@ -52,6 +52,7 @@ const state = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, "utf8")) 
 const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 2));
 const slots = new Map(); // slotNo -> { taskId, pid, since, log }
 let inboxRun = null;
+const passedOver = new Map(); // task id -> skip until (ms)
 let stopping = false;
 let backoff = 0;
 
@@ -260,9 +261,12 @@ async function cycle() {
   const paused = fs.existsSync(PAUSE);
   const free = paused ? [] : freeSlots();
   const wantTasks = free.length > 0;
+  const now = Date.now();
+  for (const [id, until] of passedOver) if (until < now) passedOver.delete(id);
+  const skipIds = [...new Set([...state.declined.slice(-40), ...passedOver.keys()])].slice(-50);
   const { json } = await relay(
     `wait?agent=${encodeURIComponent(NAME)}&base=${encodeURIComponent(ROLE)}&timeout=50${wantTasks ? "&tasks=1" : ""}` +
-      (state.declined.length ? `&skip=${encodeURIComponent(state.declined.slice(-50).join(","))}` : ""),
+      (skipIds.length ? `&skip=${encodeURIComponent(skipIds.join(","))}` : ""),
     "GET",
     undefined,
     80_000,
@@ -274,9 +278,16 @@ async function cycle() {
     log(`${msgs.length} message(s) queued for the inbox run`);
   }
   if (!paused) {
-    for (const [slotNo, task] of pickTasks(json.tasks || [], free, state.declined)) {
+    const offered = json.tasks || [];
+    const picked = pickTasks(offered, free, state.declined, { acceptUnassigned: cfg.acceptUnassigned !== false, role: ROLE, name: NAME });
+    // Tasks offered but not taken (filtered out) are skipped for 30 min so /wait doesn't
+    // return them again at once and spin.
+    const pickedIds = new Set(picked.map(([, t]) => t.id));
+    if (picked.length < free.length) for (const t of offered) if (!pickedIds.has(t.id)) passedOver.set(t.id, now + 30 * 60_000);
+    for (const [slotNo, task] of picked) {
       await startTask(slotNo, task).catch((e) => log(`start ${task.id} failed: ${e.message}`));
     }
+    if (state.declined.length > 200) state.declined = state.declined.slice(-200);
     if (Date.now() >= (state.inboxRetryAfter || 0)) startInbox();
   }
   writeStatus({ lastWaitSeconds: json.waited ?? null, error: null });

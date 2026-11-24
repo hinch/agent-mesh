@@ -268,7 +268,8 @@ node worker/mesh-worker.mjs --config ~/agent-mesh-worker.json
 
 - It long-polls `/wait` as `<role>-worker-<host>` and heartbeats its `capabilities` and `slots`.
 - **Parallelism:** with `slots: N` it claims up to N claimable tasks and runs N headless agents at once (default `claude -p`, configurable in `agent.command`/`agent.args`), one per task, each as instance `<name>-s<slot>` so leases and completions line up. More slots = more requests in flight = more tokens per second from that machine. Each run should use its own git worktree (the prompt says so).
-- Messages for the role are batched into one "inbox" agent run at a time (`inbox.instructionsFile`).
+- `acceptUnassigned: false` makes a worker take only tasks published with `assignTo` its role, for machines that must not pick up general work written for another setup.
+- Messages for the role are batched into one "inbox" agent run at a time (`inbox.instructionsFile`; `inbox.enabled: false` turns it off).
 - When a run ends without closing its task, the worker releases it (so another machine can try) and fails it after `maxAttempts`.
 - Secrets come from `MESH_URL`/`MESH_KEY` or the `agent-mesh` entry of an MCP config (`meshConfig`); each run gets a temp MCP config that is deleted afterwards.
 - `PAUSE` in the state dir (`~/.agent-mesh/worker/<name>/`) stops new launches; `status.json` shows slots, runs and queue; logs are in `runs/`.

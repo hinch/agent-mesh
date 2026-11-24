@@ -21,14 +21,19 @@ export function nextBackoffMs(prev) {
  * Assign claimable tasks (already sorted best-first by the relay) to free slots.
  * Skips declined ids and duplicates. Returns [[slotNo, task], ...].
  */
-export function pickTasks(tasks, freeSlots, declined = []) {
+export function pickTasks(tasks, freeSlots, declined = [], opts = {}) {
   const skip = new Set(declined);
   const out = [];
   const used = new Set();
+  // acceptUnassigned=false: only tasks routed to this role/instance with assignTo
+  // (for machines that must not pick up general work written for another setup).
+  const routedOnly = opts.acceptUnassigned === false;
+  const mine = new Set([opts.role, opts.name].filter(Boolean));
   let i = 0;
   for (const t of tasks) {
     if (i >= freeSlots.length) break;
     if (!t || !t.id || skip.has(t.id) || used.has(t.id)) continue;
+    if (routedOnly && !(t.assignTo && mine.has(t.assignTo))) continue;
     used.add(t.id);
     out.push([freeSlots[i++], t]);
   }
